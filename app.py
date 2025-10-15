@@ -1,132 +1,200 @@
-# app.py
-
 import streamlit as st
 import openai
-import finnhub
 import json
+import pandas as pd
+import requests
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
 
 # --- 1. API Key and Client Configuration ---
-
-# Correctly load API keys from Streamlit's secrets management
 try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
+    POLYGON_API_KEY = st.secrets["POLYGON_API_KEY"]
+    TWELVE_DATA_API_KEY = st.secrets["TWELVE_DATA_API_KEY"]
+    FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"] 
 except KeyError as e:
-    st.error(f"ERROR: The secret key '{e.args[0]}' was not found in your secrets file.")
-    st.info("Please make sure your .streamlit/secrets.toml file contains your OPENAI_API_KEY and FINNHUB_API_KEY.")
+    st.error(f"ERROR: The secret key '{e.args[0]}' was not found.")
+    st.info("Please update your secrets file with your OPENAI, POLYGON, TWELVE_DATA, and FINNHUB API keys.")
     st.stop()
 
-# Configure the OpenAI client
-try:
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-except Exception as e:
-    st.error(f"Failed to initialize OpenAI client: {e}")
-    st.stop()
+# Initialize clients and base URLs
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
+import finnhub
+finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
+POLYGON_BASE_URL = 'https://api.polygon.io'
+TD_BASE_URL = 'https://api.twelvedata.com'
 
-# Configure the Finnhub client
-try:
-    finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
-except Exception as e:
-    st.error(f"Failed to initialize Finnhub client: {e}")
-    st.stop()
+# --- 2. Tool Functions with Optimized API Strategy ---
 
-# --- 2. The "Tool" Definition (The Python function the AI can call) ---
-
-def get_stock_price(ticker_symbol: str):
-    """
-    Gets the latest stock price for a given ticker symbol using the Finnhub API.
-    Args:
-        ticker_symbol: The stock ticker symbol (e.g., "AAPL", "GOOG").
-    Returns:
-        A JSON string with the current price, change, and other details,
-        or an error message if the ticker is not found.
-    """
+def get_stock_price_and_vwap(ticker_symbol: str):
+    """Gets the previous day's closing price, change, and Volume Weighted Average Price (VWAP) from Polygon.io."""
     try:
-        quote = finnhub_client.quote(ticker_symbol)
-        if quote.get('c') == 0 and quote.get('d') is None:
-            return json.dumps({"error": f"No data found for ticker: {ticker_symbol}."})
+        ticker_symbol = ticker_symbol.upper()
+        url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker_symbol}/prev"
+        params = {'apiKey': POLYGON_API_KEY}
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("resultsCount", 0) == 0:
+            return json.dumps({"error": f"No previous day data found for {ticker_symbol} on Polygon.io."})
         
-        price_data = {
-            "ticker": ticker_symbol, "current_price": quote.get('c'), "change": quote.get('d'),
-            "percent_change": quote.get('dp'), "high_price_today": quote.get('h'), "low_price_today": quote.get('l'),
-        }
-        return json.dumps(price_data)
+        result = data['results'][0]
+        return json.dumps({
+            "ticker": data['ticker'],
+            "close": result['c'],
+            "high": result['h'],
+            "low": result['l'],
+            "open": result['o'],
+            "volume": result['v'],
+            "vwap": result.get('vw'), # VWAP is included in this endpoint
+            "change": result['c'] - result['o'], # Calculate change
+            "percent_change": ((result['c'] - result['o']) / result['o']) * 100
+        })
     except Exception as e:
-        return json.dumps({"error": f"An API error occurred: {str(e)}"})
+        return json.dumps({"error": f"An error occurred with Polygon.io price check: {str(e)}"})
 
-# --- 3. OpenAI Tool and Model Configuration ---
+def get_company_news(ticker_symbol: str):
+    """Gets the latest news with sentiment analysis from Finnhub."""
+    try:
+        ticker_symbol = ticker_symbol.upper()
+        today = datetime.now().strftime('%Y-%m-%d')
+        one_week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        news = finnhub_client.company_news(ticker_symbol, _from=one_week_ago, to=today)
+        if not news:
+            return json.dumps({"message": "No recent news found from Finnhub."})
+        return json.dumps([{'headline': article['headline'], 'summary': article['summary']} for article in news[:5]])
+    except Exception as e:
+        return json.dumps({"error": f"An unexpected error occurred while fetching news from Finnhub: {str(e)}"})
 
+def get_candlestick_chart(ticker_symbol: str):
+    """Gets historical data from Polygon.io to display as a chart."""
+    try:
+        ticker_symbol = ticker_symbol.upper()
+        today = datetime.now()
+        one_year_ago = today - timedelta(days=365)
+        url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker_symbol}/range/1/day/{one_year_ago.strftime('%Y-%m-%d')}/{today.strftime('%Y-%m-%d')}"
+        params = {'apiKey': POLYGON_API_KEY}
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != "OK" or data.get("resultsCount", 0) == 0:
+            return json.dumps({"error": "No historical data found on Polygon.io for this ticker."})
+        
+        df = pd.DataFrame(data['results'])
+        df['time'] = pd.to_datetime(df['t'], unit='ms')
+        df = df.rename(columns={'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'})
+        df = df.sort_index()
+
+        fig = go.Figure(data=[go.Candlestick(x=df['time'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'])])
+        fig.update_layout(title=f'{ticker_symbol} Candlestick Chart (Data from Polygon.io)', xaxis_title='Date', yaxis_title='Price (USD)', xaxis_rangeslider_visible=False, template='plotly_dark')
+        
+        return json.dumps({"display_plotly_chart": True, "chart_json": fig.to_json()})
+    except Exception as e:
+        return json.dumps({"error": f"An error occurred with Polygon.io charting: {str(e)}"})
+
+def get_technical_analysis(ticker_symbol: str):
+    """Gets a summary of key technical indicators (RSI, MACD, EMA, ADX) from Twelve Data."""
+    try:
+        ticker_symbol = ticker_symbol.upper()
+        indicators = ['RSI', 'MACD', 'EMA', 'ADX']
+        results = {}
+        for indicator in indicators:
+            params = {
+                'symbol': ticker_symbol, 'interval': '1day', 'apikey': TWELVE_DATA_API_KEY,
+                'outputsize': 1 # We only need the latest value
+            }
+            # Add specific parameters for each indicator
+            if indicator == 'MACD':
+                params['fast_period'] = 12
+                params['slow_period'] = 26
+                params['signal_period'] = 9
+
+            response = requests.get(f"{TD_BASE_URL}/{indicator.lower()}", params=params)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") == "ok" and data.get("values"):
+                latest_point = data['values'][0]
+                results[indicator] = {k: round(float(v), 2) for k, v in latest_point.items() if k != 'datetime'}
+        
+        if not results:
+            return json.dumps({"error": "Could not retrieve any technical indicators from Twelve Data."})
+            
+        return json.dumps(results)
+    except Exception as e:
+        return json.dumps({"error": f"An error occurred during technical analysis with Twelve Data: {str(e)}"})
+
+# --- 3. OpenAI Tool and Model Configuration (Optimized) ---
 tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_stock_price",
-            "description": "Get the latest stock price for a specific ticker symbol",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticker_symbol": {"type": "string", "description": "The stock ticker symbol, e.g., NVDA for NVIDIA."},
-                },
-                "required": ["ticker_symbol"],
-            },
-        },
-    }
+    {"type": "function", "function": {"name": "get_stock_price_and_vwap", "description": "Get the latest stock price and VWAP from Polygon.io.", "parameters": {"type": "object", "properties": {"ticker_symbol": {"type": "string"}}, "required": ["ticker_symbol"]}}},
+    {"type": "function", "function": {"name": "get_company_news", "description": "Get the latest news for a company from Finnhub.", "parameters": {"type": "object", "properties": {"ticker_symbol": {"type": "string"}}, "required": ["ticker_symbol"]}}},
+    {"type": "function", "function": {"name": "get_candlestick_chart", "description": "Display an interactive candlestick chart from Polygon.io.", "parameters": {"type": "object", "properties": {"ticker_symbol": {"type": "string"}}, "required": ["ticker_symbol"]}}},
+    {"type": "function", "function": {"name": "get_technical_analysis", "description": "Get key technical indicators (RSI, MACD, EMA, ADX) for a stock from Twelve Data.", "parameters": {"type": "object", "properties": {"ticker_symbol": {"type": "string"}}, "required": ["ticker_symbol"]}}},
 ]
 MODEL = "gpt-4o"
+available_functions = {
+    "get_stock_price_and_vwap": get_stock_price_and_vwap,
+    "get_company_news": get_company_news,
+    "get_candlestick_chart": get_candlestick_chart,
+    "get_technical_analysis": get_technical_analysis,
+}
 
-# --- 4. Streamlit UI Setup ---
-
-st.set_page_config(page_title="AI Stock Assistant (GPT)", page_icon="📈")
-st.title("📈 AI Stock Assistant (GPT)")
-st.caption("Ask me for the latest stock prices! (e.g., 'What is the price of NVDA?')")
+# --- 4 & 5. Streamlit UI and Chat Logic ---
+st.set_page_config(page_title="AI Financial Co-pilot", page_icon="📈", layout="wide")
+st.title("📈 AI Financial Co-pilot")
+st.caption("Optimized with Polygon.io, Twelve Data, and Finnhub. How can I help?")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for message in st.session_state.messages:
-    # Don't display tool messages or assistant messages without content
     if message["role"] != "tool" and message.get("content"):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-# --- 5. Main Chat Logic for OpenAI ---
-
-if prompt := st.chat_input("What is the price of..."):
+if prompt := st.chat_input("Ask about a stock..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            # *** THE FIX: Create a clean version of the history for the API call ***
-            # This removes any messages where 'content' is None, which causes the error.
+        with st.spinner("Analyzing..."):
             api_messages = [msg for msg in st.session_state.messages if msg.get("content") is not None or msg.get("tool_calls")]
-            
-            # First API Call
             response = client.chat.completions.create(
-                model=MODEL,
-                messages=api_messages,
-                tools=tools,
-                tool_choice="auto",
+                model=MODEL, messages=api_messages, tools=tools, tool_choice="auto",
             )
             response_message = response.choices[0].message
             st.session_state.messages.append(response_message.model_dump(exclude_unset=True))
 
             if response_message.tool_calls:
-                st.write("🤖 Calling Finnhub API...")
-                function_name = response_message.tool_calls[0].function.name
-                function_args = json.loads(response_message.tool_calls[0].function.arguments)
-                function_response = get_stock_price(ticker_symbol=function_args.get("ticker_symbol"))
+                tool_outputs = []
+                for tool_call in response_message.tool_calls:
+                    function_name = tool_call.function.name
+                    function_to_call = available_functions[function_name]
+                    function_args = json.loads(tool_call.function.arguments)
+                    st.write(f"🤖 Calling `{function_name}`...")
+                    function_response_str = function_to_call(**function_args)
+                    
+                    try:
+                        response_data = json.loads(function_response_str)
+                        if isinstance(response_data, dict):
+                            if error_message := response_data.get("error"):
+                                st.error(f"API Error for `{function_name}`: {error_message}")
+                            
+                            elif response_data.get("display_plotly_chart"):
+                                fig_json = response_data["chart_json"]
+                                fig = go.Figure(json.loads(fig_json))
+                                st.plotly_chart(fig, use_container_width=True)
 
-                st.session_state.messages.append(
-                    {"tool_call_id": response_message.tool_calls[0].id, "role": "tool", "name": function_name, "content": function_response}
-                )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-                # Second API Call, using the full history
-                second_response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=st.session_state.messages,
-                )
+                    tool_outputs.append({
+                        "tool_call_id": tool_call.id, "role": "tool",
+                        "name": function_name, "content": function_response_str,
+                    })
+                
+                st.session_state.messages.extend(tool_outputs)
+                second_response = client.chat.completions.create(model=MODEL, messages=st.session_state.messages)
                 final_response_message = second_response.choices[0].message
                 st.markdown(final_response_message.content)
                 st.session_state.messages.append(final_response_message.model_dump(exclude_unset=True))
